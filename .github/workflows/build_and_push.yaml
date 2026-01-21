@@ -35,7 +35,7 @@ jobs:
 
       - name: Generate Prisma client
         run: |
-          yarn dlx prisma@4.15.0 generate \
+          yarn dlx prisma@6.6.0 generate \
             --schema packages/backend/server/schema.prisma
 
       - name: Login to Docker Hub
