@@ -1,0 +1,20 @@
+# Managed by Anubis onboarding: the logic lives in luuna-tech/security-platform.
+name: Semgrep SAST
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+jobs:
+  semgrep:
+    uses: luuna-tech/security-platform/.github/workflows/sast-semgrep.yml@master
+    secrets: inherit
+    with:
+      anubis-team: shipping
