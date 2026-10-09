@@ -1,0 +1,203 @@
+# Hadolint analiza los Dockerfiles del repo y sube los hallazgos como SARIF
+# al tab Security → Code scanning, igual que Semgrep y OSV-Scanner. Escanea
+# todos los Dockerfile/*.dockerfile en una sola pasada (hadolint acepta
+# múltiples archivos por invocación), así que un repo nuevo con Dockerfiles
+# en otras rutas no requiere cambios en este workflow.
+#
+# Si no hay Dockerfiles en el repo, el job no falla: genera un SARIF vacío.
+#
+# Reutilizable desde otros repos (workflow_call). Ejemplo de caller:
+#
+#   name: Hadolint
+#   on:
+#     push: { branches: [develop] }
+#     pull_request: { branches: [develop] }
+#     schedule: [{ cron: "0 8 * * 1" }]
+#   permissions: { contents: read, security-events: write, actions: read }
+#   jobs:
+#     hadolint:
+#       uses: luuna-tech/security-platform/.github/workflows/docker-hadolint.yml@master
+#       secrets: inherit   # ANUBIS_URL / ANUBIS_TOKEN (secrets org-wide)
+#       # with: { anubis-team: wms }   # o variable de repo ANUBIS_TEAM
+#
+# Solo se ingesta a Anubis desde la rama develop (push a develop o cron; en
+# cron el checkout se fuerza a develop, que debe existir en el repo).
+# Los triggers los define el caller; aquí solo vive la lógica. Cambios en este
+# archivo (rama @master) se propagan a todos los repos en su siguiente corrida.
+name: "Docker — Hadolint Dockerfile Analysis"
+
+on:
+  push:
+    branches: ["develop"]
+  pull_request:
+    branches: ["develop"]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      anubis-team:
+        description: "Grupo/equipo en Anubis. Si se omite, usa la variable de repo ANUBIS_TEAM."
+        type: string
+        default: ""
+      hadolint-version:
+        description: "Versión de Hadolint a instalar."
+        type: string
+        default: "2.12.0"
+  schedule:
+    - cron: "0 9 * * 2"  # Escaneo completo cada martes a las 9am UTC
+
+permissions:
+  contents: read
+  security-events: write   # Necesario para subir SARIF a GitHub Security
+  actions: read
+
+jobs:
+  hadolint:
+    name: Hadolint Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    env:
+      HADOLINT_VERSION: ${{ inputs.hadolint-version || '2.12.0' }}
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
+
+      - name: Instalar Hadolint
+        run: |
+          curl -sSL -o /usr/local/bin/hadolint \
+            "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-Linux-x86_64"
+          chmod +x /usr/local/bin/hadolint
+
+      - name: Ejecutar Hadolint y generar SARIF
+        run: |
+          mapfile -t dockerfiles < <(
+            find . -type f \
+              \( -iname "Dockerfile" -o -iname "Dockerfile.*" -o -iname "*.dockerfile" \) \
+              -not -path "./node_modules/*" \
+              -not -path "./.git/*"
+          )
+          echo "Dockerfiles encontrados: ${#dockerfiles[@]}"
+          printf '%s\n' "${dockerfiles[@]}"
+
+          if [ "${#dockerfiles[@]}" -eq 0 ]; then
+            echo '{"$schema":"http://json.schemastore.org/sarif-2.1.0","version":"2.1.0","runs":[{"tool":{"driver":{"name":"hadolint"}},"results":[]}]}' > hadolint-results.sarif
+          else
+            hadolint --format sarif "${dockerfiles[@]}" > hadolint-results.sarif || true
+          fi
+
+      # Deshabilitado temporalmente: Code Security/Code scanning no está
+      # habilitado todavía para este repo (falta permiso de Admin/Owner del
+      # org). Los hallazgos siguen disponibles vía el artefacto de abajo
+      # mientras se despliega la plataforma propia de findings.
+      # - name: Subir resultados a GitHub Security (Code Scanning)
+      #   uses: github/codeql-action/upload-sarif@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3
+      #   if: always()   # Subir aunque haya hallazgos
+      #   with:
+      #     sarif_file: hadolint-results.sarif
+      #     category: hadolint
+
+      - name: Subir SARIF como artefacto (respaldo)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          # Nombre fijo (sin sufijo de run_number): queda disponible para
+          # descarga manual o para la futura Reports API.
+          name: hadolint-sarif
+          path: hadolint-results.sarif
+          retention-days: 30
+
+      # El listado de "issues" incluye how_to_fix apuntando a la wiki de
+      # hadolint (github.com/hadolint/hadolint/wiki/<RULE_ID>) — hay una
+      # página por regla, así que no hace falta mantener un mapeo propio de
+      # remediación por código.
+      - name: Generar resumen de hallazgos
+        if: always()
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          jq -n \
+            --arg tool "hadolint" \
+            --arg repo "$REPO" \
+            --arg ref "$REF" \
+            --arg sha "$SHA" \
+            --argjson run_id "$RUN_ID" \
+            --argjson run_number "$RUN_NUMBER" \
+            --arg event "$EVENT_NAME" \
+            --slurpfile sarif hadolint-results.sarif \
+            '
+            ($sarif[0].runs[0].results // []) as $results
+            | {
+                tool: $tool,
+                repo: $repo,
+                ref: $ref,
+                commit: $sha,
+                run_id: $run_id,
+                run_number: $run_number,
+                triggered_by: $event,
+                findings_count: ($results | length),
+                severity_breakdown: {
+                  error:   ($results | map(select(.level == "error")) | length),
+                  warning: ($results | map(select(.level == "warning")) | length),
+                  note:    ($results | map(select(.level == "note")) | length)
+                },
+                issues: [
+                  $results[] | {
+                    rule_id:    .ruleId,
+                    severity:   .level,
+                    message:    .message.text,
+                    file:       .locations[0].physicalLocation.artifactLocation.uri,
+                    line:       .locations[0].physicalLocation.region.startLine,
+                    how_to_fix: ("https://github.com/hadolint/hadolint/wiki/" + .ruleId)
+                  }
+                ]
+              }
+            ' > report-summary.json
+          cat report-summary.json
+
+      # Solo en push/schedule: un scan disparado por un PR corre sobre la
+      # rama de la PR (no necesariamente refleja el estado de main), y
+      # sync_findings_for_scan en Anubis asume que cada ingesta es un scan
+      # completo del repo — auto-resuelve cualquier hallazgo abierto que no
+      # venga en esta corrida. Ingerir scans de PR mezclaría ramas y
+      # resolvería por error hallazgos que sí siguen vigentes en main.
+      - name: Validar que ANUBIS_TEAM está configurado
+        if: always() && (github.ref_name == 'develop' || github.event_name == 'schedule')
+        env:
+          ANUBIS_TEAM: ${{ inputs.anubis-team || vars.ANUBIS_TEAM }}
+        run: |
+          if [ -z "$ANUBIS_TEAM" ]; then
+            echo "::error::La variable de repo ANUBIS_TEAM no está configurada (Settings > Secrets and variables > Actions > Variables). Es obligatoria para reportar hallazgos a Anubis."
+            exit 1
+          fi
+
+      - name: Enviar hallazgos a Anubis
+        if: always() && (github.ref_name == 'develop' || github.event_name == 'schedule')
+        continue-on-error: true
+        env:
+          # security-platform reporta a la instancia de develop; el resto de
+          # repos a prod. github.repository es el repo caller aun en workflow_call.
+          ANUBIS_URL: ${{ github.repository == 'luuna-tech/security-platform' && secrets.ANUBIS_URL_DEV || secrets.ANUBIS_URL }}
+          ANUBIS_TOKEN: ${{ github.repository == 'luuna-tech/security-platform' && secrets.ANUBIS_TOKEN_DEV || secrets.ANUBIS_TOKEN }}
+          ANUBIS_TEAM: ${{ inputs.anubis-team || vars.ANUBIS_TEAM }}
+          REPO: ${{ github.repository }}
+          # Siempre develop: en cron el checkout es de develop, no de la rama
+          # por defecto, así que github.sha/ref_name no aplican.
+          BRANCH: develop
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          SHA=$(git rev-parse HEAD)
+          curl --fail --silent --show-error \
+            --max-time 30 \
+            --request POST \
+            --url "${ANUBIS_URL}/api/findings/ingest/hadolint/?repository=${REPO}&commit_sha=${SHA}&branch=${BRANCH}&team=${ANUBIS_TEAM}" \
+            --header "Authorization: Token ${ANUBIS_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data-binary @report-summary.json

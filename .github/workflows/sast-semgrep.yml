@@ -1,0 +1,204 @@
+# --config auto ya es poliglota: Semgrep elige el ruleset según la extensión
+# de cada archivo que encuentra (.js/.ts -> reglas JS, .py -> reglas Python,
+# etc.), así que no necesita lógica condicional para adaptarse a Node.js o
+# Python — si se agrega código del otro lenguaje, este workflow lo cubre sin
+# cambios.
+#
+# Reutilizable desde otros repos (workflow_call). Ejemplo de caller:
+#
+#   name: Semgrep SAST
+#   on:
+#     push: { branches: [develop] }
+#     pull_request: { branches: [develop] }
+#     schedule: [{ cron: "0 8 * * 1" }]
+#   permissions: { contents: read, security-events: write, actions: read }
+#   jobs:
+#     semgrep:
+#       uses: luuna-tech/security-platform/.github/workflows/sast-semgrep.yml@master
+#       secrets: inherit   # ANUBIS_URL / ANUBIS_TOKEN (secrets org-wide)
+#       # with: { anubis-team: wms }   # o variable de repo ANUBIS_TEAM
+#
+# Solo se ingesta a Anubis desde la rama develop (push a develop o cron; en
+# cron el checkout se fuerza a develop, que debe existir en el repo).
+# Los triggers los define el caller; aquí solo vive la lógica. Cambios en este
+# archivo (rama @master) se propagan a todos los repos en su siguiente corrida.
+name: Semgrep SAST
+
+on:
+  push:
+    branches: ["develop"]
+  pull_request:
+    branches: ["develop"]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      anubis-team:
+        description: "Grupo/equipo en Anubis. Si se omite, usa la variable de repo ANUBIS_TEAM."
+        type: string
+        default: ""
+      exclude-paths:
+        description: "Globs a excluir de Semgrep, separados por coma."
+        type: string
+        default: "node_modules/**,dist/**,build/**,.venv/**,**/*.test.js,**/*.spec.js"
+  schedule:
+    # Scan completo cada lunes a las 8am UTC
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: read
+  security-events: write   # Necesario para subir SARIF a GitHub Security
+  actions: read
+
+jobs:
+  semgrep:
+    name: Semgrep Scan
+    runs-on: ubuntu-latest
+
+    container:
+      image: semgrep/semgrep
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
+
+      - name: Ejecutar Semgrep y generar SARIF
+        run: |
+          set -f
+          IFS=','
+          set --
+          for p in $EXCLUDES; do set -- "$@" --exclude "$p"; done
+          unset IFS
+          semgrep scan \
+            --config auto \
+            --sarif \
+            --output semgrep-results.sarif \
+            --severity WARNING \
+            --severity ERROR \
+            "$@"
+        env:
+          # Opcional: token de Semgrep Cloud para ver resultados en dashboard
+          # SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+          SEMGREP_TIMEOUT: 300
+          EXCLUDES: ${{ inputs.exclude-paths || 'node_modules/**,dist/**,build/**,.venv/**,**/*.test.js,**/*.spec.js' }}
+
+      # Segunda corrida en el JSON nativo de Semgrep (--json, no SARIF): el
+      # parser de Anubis (findings/parsers/semgrep.py) espera la forma nativa
+      # de `semgrep --json` (results[].check_id/path/start/end/extra), no
+      # SARIF — el SARIF de arriba no trae esos campos.
+      - name: Ejecutar Semgrep y generar JSON (para Anubis)
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          set -f
+          IFS=','
+          set --
+          for p in $EXCLUDES; do set -- "$@" --exclude "$p"; done
+          unset IFS
+          semgrep scan \
+            --config auto \
+            --json \
+            --output semgrep-results.json \
+            --severity WARNING \
+            --severity ERROR \
+            "$@"
+        env:
+          SEMGREP_TIMEOUT: 300
+          EXCLUDES: ${{ inputs.exclude-paths || 'node_modules/**,dist/**,build/**,.venv/**,**/*.test.js,**/*.spec.js' }}
+
+      # Deshabilitado temporalmente: Code Security/Code scanning no está
+      # habilitado todavía para este repo (falta permiso de Admin/Owner del
+      # org). Los hallazgos siguen disponibles vía el artefacto de abajo
+      # mientras se despliega la plataforma propia de findings.
+      # - name: Subir resultados a GitHub Security (Code Scanning)
+      #   uses: github/codeql-action/upload-sarif@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3
+      #   if: always()   # Subir aunque haya hallazgos
+      #   with:
+      #     sarif_file: semgrep-results.sarif
+      #     category: semgrep
+
+      - name: Subir SARIF como artefacto (respaldo)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          # Nombre fijo (sin sufijo de run_number): queda disponible para
+          # descarga manual o para la futura Reports API.
+          name: semgrep-sarif
+          path: semgrep-results.sarif
+          retention-days: 30
+
+      - name: Subir JSON como artefacto (respaldo, para depurar la ingesta)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always() && github.event_name != 'pull_request'
+        with:
+          name: semgrep-json
+          path: semgrep-results.json
+          retention-days: 30
+
+      - name: Generar resumen de hallazgos
+        id: summary
+        if: always()
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          count=$(jq '[.runs[].results[]] | length' semgrep-results.sarif)
+          errors=$(jq '[.runs[].results[] | select(.level == "error")] | length' semgrep-results.sarif)
+          warnings=$(jq '[.runs[].results[] | select(.level == "warning")] | length' semgrep-results.sarif)
+          jq -n \
+            --arg tool "semgrep" \
+            --arg repo "$REPO" \
+            --arg ref "$REF" \
+            --arg sha "$SHA" \
+            --argjson run_id "$RUN_ID" \
+            --argjson run_number "$RUN_NUMBER" \
+            --arg event "$EVENT_NAME" \
+            --argjson findings_count "$count" \
+            --argjson errors "$errors" \
+            --argjson warnings "$warnings" \
+            '{tool: $tool, repo: $repo, ref: $ref, commit: $sha, run_id: $run_id, run_number: $run_number, triggered_by: $event, findings_count: $findings_count, severity_breakdown: {error: $errors, warning: $warnings}}' \
+            > report-summary.json
+          cat report-summary.json
+
+      # Solo en push/schedule, no en PR: un scan de PR corre sobre la rama de
+      # la PR, no sobre main, y sync_findings_for_scan en Anubis asume que
+      # cada ingesta es un scan completo del repo (auto-resuelve cualquier
+      # hallazgo abierto que no venga en esta corrida) — ingerir scans de PR
+      # resolvería por error hallazgos que siguen vigentes en main.
+      - name: Validar que ANUBIS_TEAM está configurado
+        if: always() && (github.ref_name == 'develop' || github.event_name == 'schedule')
+        env:
+          ANUBIS_TEAM: ${{ inputs.anubis-team || vars.ANUBIS_TEAM }}
+        run: |
+          if [ -z "$ANUBIS_TEAM" ]; then
+            echo "::error::La variable de repo ANUBIS_TEAM no está configurada (Settings > Secrets and variables > Actions > Variables). Es obligatoria para reportar hallazgos a Anubis."
+            exit 1
+          fi
+
+      - name: Enviar hallazgos a Anubis
+        if: always() && (github.ref_name == 'develop' || github.event_name == 'schedule')
+        continue-on-error: true
+        env:
+          # security-platform reporta a la instancia de develop; el resto de
+          # repos a prod. github.repository es el repo caller aun en workflow_call.
+          ANUBIS_URL: ${{ github.repository == 'luuna-tech/security-platform' && secrets.ANUBIS_URL_DEV || secrets.ANUBIS_URL }}
+          ANUBIS_TOKEN: ${{ github.repository == 'luuna-tech/security-platform' && secrets.ANUBIS_TOKEN_DEV || secrets.ANUBIS_TOKEN }}
+          ANUBIS_TEAM: ${{ inputs.anubis-team || vars.ANUBIS_TEAM }}
+          REPO: ${{ github.repository }}
+          # Siempre develop: en cron el checkout es de develop, no de la rama
+          # por defecto, así que github.sha/ref_name no aplican.
+          BRANCH: develop
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          SHA=$(git rev-parse HEAD)
+          curl --fail --silent --show-error \
+            --max-time 30 \
+            --request POST \
+            --url "${ANUBIS_URL}/api/findings/ingest/semgrep/?repository=${REPO}&commit_sha=${SHA}&branch=${BRANCH}&team=${ANUBIS_TEAM}" \
+            --header "Authorization: Token ${ANUBIS_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data-binary @semgrep-results.json
